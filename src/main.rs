@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use futures::{future::Either, StreamExt};
 use libp2p::{
@@ -9,7 +9,9 @@ use libp2p::{
     tcp, yamux, PeerId, Swarm, Transport,
 };
 use libp2p_quic as quic;
+use tokio::{fs::File, io::AsyncWriteExt, task};
 
+const RESPONSE_SIZE: u64 = 9 * 1024 * 1024;
 type ReqResType = libp2p_request_response::Event<FileRequest, FileResponse>;
 
 #[derive(NetworkBehaviour)]
@@ -21,28 +23,26 @@ struct MyBehaviour {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct FileRequest {
     name: String,
+    written: u64,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct FileResponse {
+    path: String,
     hash: String,
-    name: Option<String>,
-    content: FileContent,
-    block: u64,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-enum FileContent {
-    Start(Vec<u8>),
-    Continue(Vec<u8>),
-    End(Vec<u8>),
+    buf: Vec<u8>,
+    written: u64,
+    start: bool,
+    end: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let mut swarm = build_swarp();
 
-    let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
+    let (s, mut r) = tokio::sync::mpsc::unbounded_channel::<(PeerId, FileResponse)>();
+    let (s2, mut r2) = tokio::sync::mpsc::unbounded_channel::<(PeerId, FileRequest)>();
+    let (cs, cr) = crossbeam_channel::unbounded::<FileResponse>();
 
     loop {
         tokio::select! {
@@ -52,7 +52,7 @@ async fn main() {
                     list.dedup_by(|a, b| a.0 == b.0);
                     for (peer_id, _multiaddr) in list {
                         println!("\nmDNS discovered a new peer: {peer_id}");
-                        let req = FileRequest { name: "demo/picture.jpg".to_string() };
+                        let req = FileRequest { name: "demo/picture.jpg".to_string(), written: 0};
                         swarm.behaviour_mut().reqres.send_request(&peer_id, req);
                     }
                 },
@@ -63,28 +63,24 @@ async fn main() {
                                 libp2p_request_response::Message::Request { request_id, request, channel } => {
                                     println!("Received request from {peer} with id {request_id}: {request:?}");
                                     if let Ok(mut file) = std::fs::File::open(request.name.clone()) {
-                                        let name = request.name.clone();
-                                        let mut buffer = [0; 1024];
-                                        let mut block = 0;
-                                        loop {
-                                            let size = file.read(&mut buffer).unwrap();
-                                            if size == 0 {
-                                                break;
-                                            }
-                                            let content = if block == 0 {
-                                                FileContent::Start(buffer[..size].to_vec())
-                                            } else {
-                                                FileContent::Continue(buffer[..size].to_vec())
-                                            };
-                                            let response = FileResponse { hash: "hash".to_string(), name: Some(name.clone()), content, block };
-                                            swarm.behaviour_mut().reqres.send_response(channel, response);
-                                            block += 1;
-                                        }
+                                        _ = file.seek(SeekFrom::Start(request.written));
+                                        let mut buffer = [0u8; RESPONSE_SIZE as usize];
+                                        let bytes_read = file.read(&mut buffer);
+                                        let is_end = bytes_read.unwrap() < buffer.len();
+                                        let response = FileResponse {
+                                            path: request.name.clone(),
+                                            hash: "hash".to_string(),
+                                            buf: buffer.to_vec(),
+                                            written: request.written,
+                                            start: false,
+                                            end: is_end,
+                                        };
+                                        _ = swarm.behaviour_mut().reqres.send_response(channel, response);
                                     }
                                 },
                                 libp2p_request_response::Message::Response { request_id, response } => {
                                     println!("Received response from {peer} with id {request_id}: {response:?}");
-                                    _ = s.send(response);
+                                    _ = s.send((peer, response));
                                 },
                             }
                         },
@@ -93,22 +89,47 @@ async fn main() {
                 },
                 _ => {},
             },
-            response = r.recv() => {
-                if let Some(response) = response {
-                    let FileResponse { hash, name, content, block } = response;
-                    match content {
-                        FileContent::Start(data) => {
-                            println!("Received file {name} with hash {hash} and block {block} with size {size}", name = name.unwrap_or("".to_string()), hash = hash, block = block, size = data.len());
-                        },
-                        FileContent::Continue(data) => {
-                            println!("Received file {name} with hash {hash} and block {block} with size {size}", name = name.unwrap_or("".to_string()), hash = hash, block = block, size = data.len());
-                        },
-                        FileContent::End(data) => {
-                            println!("Received file {name} with hash {hash} and block {block} with size {size}", name = name.unwrap_or("".to_string()), hash = hash, block = block, size = data.len());
-                        },
+            r = r.recv() => {
+                if let Some((peer, response)) = r {
+                    if response.start {
+                        task::spawn(handle_response(peer, response, cr.clone(), s2.clone()));
+                    } else {
+                        cs.send(response).unwrap();
                     }
                 }
             }
+            r2 = r2.recv() => {
+                if let Some((peer, req)) = r2 {
+                    swarm.behaviour_mut().reqres.send_request(&peer, req);
+                }
+            }
+        }
+    }
+}
+
+type CR = crossbeam_channel::Receiver<FileResponse>;
+type TS = tokio::sync::mpsc::UnboundedSender<(PeerId, FileRequest)>;
+
+async fn handle_response(peer: PeerId, response: FileResponse, cr: CR, s: TS) {
+    let path = format!("tmp/{}", response.path);
+    let mut file = File::create(path).await.unwrap();
+    file.write_all(&response.buf).await.unwrap();
+    loop {
+        if let Ok(r) = cr.recv() {
+            if r.path == response.path {
+                file.write_all(&r.buf).await.unwrap();
+                if r.end {
+                    break;
+                }
+                let written = r.written + r.buf.len() as u64;
+                let request = FileRequest {
+                    name: response.path.clone(),
+                    written,
+                };
+                s.send((peer, request)).unwrap();
+            }
+        } else {
+            break;
         }
     }
 }
