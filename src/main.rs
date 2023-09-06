@@ -11,7 +11,7 @@ use libp2p::{
 use libp2p_quic as quic;
 use tokio::{fs::File, io::AsyncWriteExt, task};
 
-const RESPONSE_SIZE: u64 = 9 * 1024 * 1024;
+const RESPONSE_SIZE: u64 = (10 * 1024 * 1024) - 100;
 type ReqResType = libp2p_request_response::Event<FileRequest, FileResponse>;
 
 #[derive(NetworkBehaviour)]
