@@ -1,23 +1,28 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 
-use futures::{future::Either, StreamExt};
+use futures::StreamExt;
 use libp2p::{
-    core::{muxing::StreamMuxerBox, transport::OrTransport, upgrade},
-    identity, mdns, noise,
+    core::upgrade,
+    identity::Keypair,
+    kad::{
+        self,
+        store::{MemoryStore, MemoryStoreConfig},
+        Kademlia, KademliaEvent, RecordKey,
+    },
+    mdns, noise,
     swarm::NetworkBehaviour,
     swarm::{SwarmBuilder, SwarmEvent},
     tcp, yamux, PeerId, Swarm, Transport,
 };
-use libp2p_quic as quic;
-use tokio::{fs::File, io::AsyncWriteExt, task};
 
-const RESPONSE_SIZE: u64 = (10 * 1024 * 1024) - 100;
-type ReqResType = libp2p_request_response::Event<FileRequest, FileResponse>;
+use mdns::Event::Discovered;
+use tokio::task;
 
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
-    mdns: mdns::async_io::Behaviour,
     reqres: libp2p::request_response::cbor::Behaviour<FileRequest, FileResponse>,
+    mdns: mdns::async_io::Behaviour,
+    kad: Kademlia<MemoryStore>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -38,142 +43,97 @@ struct FileResponse {
 
 #[tokio::main]
 async fn main() {
-    let mut swarm = build_swarp();
-
-    let (s, mut r) = tokio::sync::mpsc::unbounded_channel::<(PeerId, FileResponse)>();
-    let (s2, mut r2) = tokio::sync::mpsc::unbounded_channel::<(PeerId, FileRequest)>();
-    let (cs, cr) = crossbeam_channel::unbounded::<FileResponse>();
-
+    let (mut swarm, _key_pair, _my_peer) = build_swarp();
+    let mut file = std::fs::File::open("demo/picture.jpg").unwrap();
     loop {
-        tokio::select! {
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(mut list))) => {
-                    list.sort_by(|a, b| a.0.cmp(&b.0));
-                    list.dedup_by(|a, b| a.0 == b.0);
-                    for (peer_id, _multiaddr) in list {
-                        println!("\nmDNS discovered a new peer: {peer_id}");
-                        let req = FileRequest { name: "demo/picture.jpg".to_string(), written: 0};
-                        swarm.behaviour_mut().reqres.send_request(&peer_id, req);
-                    }
-                },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Reqres(reqres)) => {
-                    match reqres {
-                        ReqResType::Message {peer, message } => {
-                            match message {
-                                libp2p_request_response::Message::Request { request_id, request, channel } => {
-                                    println!("Received request from {peer} with id {request_id}: {request:?}");
-                                    if let Ok(mut file) = std::fs::File::open(request.name.clone()) {
-                                        _ = file.seek(SeekFrom::Start(request.written));
-                                        let mut buffer = [0u8; RESPONSE_SIZE as usize];
-                                        let bytes_read = file.read(&mut buffer);
-                                        let is_end = bytes_read.unwrap() < buffer.len();
-                                        let response = FileResponse {
-                                            path: request.name.clone(),
-                                            hash: "hash".to_string(),
-                                            buf: buffer.to_vec(),
-                                            written: request.written,
-                                            start: false,
-                                            end: is_end,
-                                        };
-                                        _ = swarm.behaviour_mut().reqres.send_response(channel, response);
-                                    }
-                                },
-                                libp2p_request_response::Message::Response { request_id, response } => {
-                                    println!("Received response from {peer} with id {request_id}: {response:?}");
-                                    _ = s.send((peer, response));
-                                },
-                            }
-                        },
-                        _ => {}
-                    }
-                },
-                _ => {},
-            },
-            r = r.recv() => {
-                if let Some((peer, response)) = r {
-                    if response.start {
-                        task::spawn(handle_response(peer, response, cr.clone(), s2.clone()));
-                    } else {
-                        cs.send(response).unwrap();
+        let event = swarm.select_next_some().await;
+        match event {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("Listening on {:?}", address);
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(Discovered(peers_datum))) => {
+                for peer_data in peers_datum {
+                    let peer = peer_data.0.clone();
+                    let _addr = peer_data.1.clone();
+                    println!("Found peer {:?}", peer);
+                    if !swarm.is_connected(&peer) {
+                        swarm.dial(peer).unwrap();
+                        let key = RecordKey::new::<String>(&"files".to_string());
+                        let mut file_buf = Vec::new();
+                        let _ = file.read_to_end(&mut file_buf).unwrap();
+                        _ = swarm.behaviour_mut().kad.put_record(
+                            kad::Record::new::<RecordKey>(key, file_buf),
+                            kad::Quorum::All,
+                        );
                     }
                 }
             }
-            r2 = r2.recv() => {
-                if let Some((peer, req)) = r2 {
-                    swarm.behaviour_mut().reqres.send_request(&peer, req);
-                }
+            SwarmEvent::Behaviour(MyBehaviourEvent::Kad(kad_event)) => {
+                task::spawn(handle_kad_event(kad_event));
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                println!("Connection established with {}", peer_id);
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                let is_closed = !swarm.is_connected(&peer_id);
+                println!("Connection with {} closed: {}", peer_id, is_closed);
+            }
+            SwarmEvent::IncomingConnection { .. } => {}
+            _ => {
+                println!("Got an event: {:?}", event);
             }
         }
     }
 }
 
-type CR = crossbeam_channel::Receiver<FileResponse>;
-type TS = tokio::sync::mpsc::UnboundedSender<(PeerId, FileRequest)>;
-
-async fn handle_response(peer: PeerId, response: FileResponse, cr: CR, s: TS) {
-    let path = format!("tmp/{}", response.path);
-    let mut file = File::create(path).await.unwrap();
-    file.write_all(&response.buf).await.unwrap();
-    loop {
-        if let Ok(r) = cr.recv() {
-            if r.path == response.path {
-                file.write_all(&r.buf).await.unwrap();
-                if r.end {
-                    break;
-                }
-                let written = r.written + r.buf.len() as u64;
-                let request = FileRequest {
-                    name: response.path.clone(),
-                    written,
-                };
-                s.send((peer, request)).unwrap();
-            }
-        } else {
-            break;
+async fn handle_kad_event(event: KademliaEvent) {
+    match event {
+        KademliaEvent::OutboundQueryProgressed {
+            id,
+            result,
+            stats,
+            step,
+        } => {
+            println!(
+                "\nOutboundQueryProgressed: id: {:?},\nresult: {:?},\nstats: {:?},\nstep: {:?}\n",
+                id, result, stats, step
+            );
+        }
+        _ => {
+            println!("UnHandled kad event: {:?}", event);
         }
     }
 }
 
-fn build_swarp() -> Swarm<MyBehaviour> {
-    let id_keys = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(id_keys.public());
-    println!("Local peer id: {local_peer_id}");
-
-    let tcp_transport = tcp::async_io::Transport::new(tcp::Config::default().nodelay(true))
-        .upgrade(upgrade::Version::V1Lazy)
+fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
+    let id_keys = Keypair::generate_ed25519();
+    let peer = PeerId::from(id_keys.public());
+    println!("Local peer id: {peer}");
+    let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), peer).unwrap();
+    let tcp_config = tcp::Config::default().nodelay(true);
+    let mut yc = yamux::Config::default();
+    yc.set_max_buffer_size(1024 * 1024 * 1024);
+    yc.set_receive_window_size(1024 * 1024 * 1024);
+    let transport = tcp::tokio::Transport::new(tcp_config)
+        .upgrade(upgrade::Version::V1)
         .authenticate(noise::Config::new(&id_keys).expect("signing libp2p-noise static keypair"))
-        .multiplex(yamux::Config::default())
-        .timeout(std::time::Duration::from_secs(10))
-        .boxed();
-    let quic_transport = quic::async_std::Transport::new(quic::Config::new(&id_keys));
-    let transport = OrTransport::new(quic_transport, tcp_transport)
-        .map(|either_output, _| match either_output {
-            Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-            Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-        })
-        .boxed();
-
-    let mut swarm = {
-        let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), local_peer_id).unwrap();
-        let behaviour = MyBehaviour {
-            mdns,
-            reqres: libp2p::request_response::cbor::Behaviour::<FileRequest, FileResponse>::new(
-                [(
-                    libp2p::StreamProtocol::new("/my-cbor-protocol"),
-                    libp2p_request_response::ProtocolSupport::Full,
-                )],
-                libp2p::request_response::Config::default(),
-            ),
-        };
-        SwarmBuilder::with_async_std_executor(transport, behaviour, local_peer_id).build()
+        .multiplex(yc);
+    let mut mc = MemoryStoreConfig::default();
+    mc.max_value_bytes = 1024 * 1024 * 1024;
+    let behaviour = MyBehaviour {
+        mdns,
+        kad: Kademlia::new(peer.clone(), MemoryStore::with_config(peer.clone(), mc)),
+        reqres: libp2p::request_response::cbor::Behaviour::<FileRequest, FileResponse>::new(
+            [(
+                libp2p::StreamProtocol::new("/my-cbor-protocol"),
+                libp2p_request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default(),
+        ),
     };
-
-    swarm
-        .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
-        .unwrap();
+    let mut swarm = SwarmBuilder::with_tokio_executor(transport.boxed(), behaviour, peer).build();
     swarm
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
         .unwrap();
-
-    swarm
+    (swarm, id_keys, peer)
 }
