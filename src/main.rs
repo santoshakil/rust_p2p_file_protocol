@@ -44,7 +44,9 @@ struct FileResponse {
 #[tokio::main]
 async fn main() {
     let (mut swarm, _key_pair, _my_peer) = build_swarp();
+    // swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Client));
     let mut file = std::fs::File::open("demo/picture.jpg").unwrap();
+    let key = RecordKey::new::<String>(&_my_peer.to_string());
     loop {
         let event = swarm.select_next_some().await;
         match event {
@@ -54,15 +56,20 @@ async fn main() {
             SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(Discovered(peers_datum))) => {
                 for peer_data in peers_datum {
                     let peer = peer_data.0.clone();
-                    let _addr = peer_data.1.clone();
+                    let addr = peer_data.1.clone();
                     println!("Found peer {:?}", peer);
                     if !swarm.is_connected(&peer) {
                         swarm.dial(peer).unwrap();
-                        let key = RecordKey::new::<String>(&"files".to_string());
+                        swarm.behaviour_mut().kad.add_address(&peer, addr);
                         let mut file_buf = Vec::new();
                         let _ = file.read_to_end(&mut file_buf).unwrap();
+                        _ = swarm.behaviour_mut().kad.start_providing(key.clone());
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         _ = swarm.behaviour_mut().kad.put_record(
-                            kad::Record::new::<RecordKey>(key, file_buf),
+                            kad::Record::new::<RecordKey>(
+                                key.clone(),
+                                "Hello from Kad".as_bytes().to_vec(),
+                            ),
                             kad::Quorum::All,
                         );
                     }
@@ -95,12 +102,12 @@ async fn handle_kad_event(event: KademliaEvent) {
             step,
         } => {
             println!(
-                "\nOutboundQueryProgressed: id: {:?},\nresult: {:?},\nstats: {:?},\nstep: {:?}\n",
+                "\nKad(OutboundQueryProgressed): id: {:?},\nresult: {:?},\nstats: {:?},\nstep: {:?}\n",
                 id, result, stats, step
             );
         }
         _ => {
-            println!("UnHandled kad event: {:?}", event);
+            println!("\nKad event: {:?}\n", event);
         }
     }
 }
@@ -114,6 +121,7 @@ fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
     let mut yc = yamux::Config::default();
     yc.set_max_buffer_size(1024 * 1024 * 1024);
     yc.set_receive_window_size(1024 * 1024 * 1024);
+    yc.set_window_update_mode(yamux::WindowUpdateMode::on_receive());
     let transport = tcp::tokio::Transport::new(tcp_config)
         .upgrade(upgrade::Version::V1)
         .authenticate(noise::Config::new(&id_keys).expect("signing libp2p-noise static keypair"))
