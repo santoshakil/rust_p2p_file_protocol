@@ -89,7 +89,7 @@ async fn handle_reqres(reqres: ReqResEvent, s: ReqResChannel) {
                     request, channel
                 );
                 let mut file_buf = Vec::new();
-                let mut file = std::fs::File::open("demo/2_2mb.jpg").unwrap();
+                let mut file = std::fs::File::open("demo/4_7mb.jpg").unwrap();
                 let _ = file.read_to_end(&mut file_buf).unwrap();
                 let res = ReqRes { data: file_buf };
                 _ = s.send((res, channel));
