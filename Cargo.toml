@@ -21,7 +21,6 @@ tokio-tungstenite = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 crossbeam-channel = "0.5"
 libp2p-bitswap = { version = "0.25", features = ["compat"] }
-# libp2p-webrtc = "0.3"
 libipld = "0.16"
 ipfs-embed = { version = "0.26", features = [
     "async_global",
