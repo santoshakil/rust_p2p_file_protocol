@@ -5,6 +5,7 @@ edition = "2021"
 
 
 [dependencies]
+libp2p-swarm = "0.43.3"
 libp2p-request-response = "0.25"
 libp2p-mplex = "0.40"
 libp2p-yamux = "0.44"
@@ -32,4 +33,4 @@ rand = "0.8"
 anyhow = "1"
 cid = "0"
 cbor4ii = { version = "0.3.1", features = ["serde1", "use_std"] }
-libp2p-swarm = "0.43.3"
+libp2p_stream_protocol = { version = "0.1.0", path = "../libp2p_stream_protocol" }

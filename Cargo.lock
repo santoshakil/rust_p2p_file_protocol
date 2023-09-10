@@ -3261,6 +3261,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p_stream_protocol"
+version = "0.1.0"
+
+[[package]]
 name = "libsecp256k1"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4666,6 +4670,7 @@ dependencies = [
  "libp2p-swarm 0.43.3",
  "libp2p-tcp 0.40.0",
  "libp2p-yamux 0.44.1",
+ "libp2p_stream_protocol",
  "rand 0.8.5",
  "serde",
  "tokio",
