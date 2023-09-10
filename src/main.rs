@@ -19,11 +19,11 @@ type ReqResChannel = UnboundedSender<(ReqRes, ResponseChannel<ReqRes>)>;
 
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
-    reqres: libp2p::request_response::cbor::Behaviour<ReqRes, ReqRes>,
+    reqres: codec::Behaviour<ReqRes, ReqRes>,
     mdns: mdns::async_io::Behaviour,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 struct ReqRes {
     data: Vec<u8>,
 }
@@ -70,8 +70,8 @@ async fn main() {
                 },
             },
             r = r.recv() => {
-                if let Some((event, chanel)) = r {
-                    _ = swarm.behaviour_mut().reqres.send_response(chanel, event);
+                if let Some((res, chanel)) = r {
+                    _ = swarm.behaviour_mut().reqres.send_response(chanel, res.clone());
                 }
             }
         }
@@ -89,7 +89,7 @@ async fn handle_reqres(reqres: ReqResEvent, s: ReqResChannel) {
                     request, channel
                 );
                 let mut file_buf = Vec::new();
-                let mut file = std::fs::File::open("demo/4_7mb.jpg").unwrap();
+                let mut file = std::fs::File::open("demo/22mb.jpg").unwrap();
                 let _ = file.read_to_end(&mut file_buf).unwrap();
                 let res = ReqRes { data: file_buf };
                 _ = s.send((res, channel));
@@ -123,7 +123,8 @@ fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
     reqres_config.set_connection_keep_alive(std::time::Duration::from_secs(60));
     let behaviour = MyBehaviour {
         mdns,
-        reqres: libp2p::request_response::cbor::Behaviour::<ReqRes, ReqRes>::new(
+        reqres: codec::Behaviour::<ReqRes, ReqRes>::with_codec(
+            codec::Codec::default(),
             [(
                 libp2p::StreamProtocol::new("/my-cbor-protocol"),
                 libp2p_request_response::ProtocolSupport::Full,
@@ -136,4 +137,128 @@ fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
         .unwrap();
     (swarm, id_keys, peer)
+}
+
+mod codec {
+    use async_trait::async_trait;
+    use cbor4ii::core::error::DecodeError;
+    use futures::prelude::*;
+    use futures::{AsyncRead, AsyncWrite};
+    use libp2p_swarm::StreamProtocol;
+    use serde::{de::DeserializeOwned, Serialize};
+    use std::{collections::TryReserveError, convert::Infallible, io, marker::PhantomData};
+
+    /// Max request size in bytes
+    const REQUEST_SIZE_MAXIMUM: u64 = 10 * 1024 * 1024;
+    /// Max response size in bytes
+    const RESPONSE_SIZE_MAXIMUM: u64 = 100 * 1024 * 1024;
+
+    pub type Behaviour<Req, Resp> = libp2p_request_response::Behaviour<Codec<Req, Resp>>;
+
+    pub struct Codec<Req, Resp> {
+        phantom: PhantomData<(Req, Resp)>,
+    }
+
+    impl<Req, Resp> Default for Codec<Req, Resp> {
+        fn default() -> Self {
+            Codec {
+                phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<Req, Resp> Clone for Codec<Req, Resp> {
+        fn clone(&self) -> Self {
+            Self::default()
+        }
+    }
+
+    #[async_trait]
+    impl<Req, Resp> libp2p_request_response::Codec for Codec<Req, Resp>
+    where
+        Req: Send + Serialize + DeserializeOwned,
+        Resp: Send + Serialize + DeserializeOwned,
+    {
+        type Protocol = StreamProtocol;
+        type Request = Req;
+        type Response = Resp;
+
+        async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Req>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let mut vec = Vec::new();
+
+            io.take(REQUEST_SIZE_MAXIMUM).read_to_end(&mut vec).await?;
+
+            cbor4ii::serde::from_slice(vec.as_slice()).map_err(decode_into_io_error)
+        }
+
+        async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Resp>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let mut vec = Vec::new();
+
+            io.take(RESPONSE_SIZE_MAXIMUM).read_to_end(&mut vec).await?;
+
+            cbor4ii::serde::from_slice(vec.as_slice()).map_err(decode_into_io_error)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data: Vec<u8> =
+                cbor4ii::serde::to_vec(Vec::new(), &req).map_err(encode_into_io_error)?;
+
+            io.write_all(data.as_ref()).await?;
+
+            Ok(())
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            resp: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data: Vec<u8> =
+                cbor4ii::serde::to_vec(Vec::new(), &resp).map_err(encode_into_io_error)?;
+
+            io.write_all(data.as_ref()).await?;
+
+            Ok(())
+        }
+    }
+
+    fn decode_into_io_error(err: cbor4ii::serde::DecodeError<Infallible>) -> io::Error {
+        match err {
+            cbor4ii::serde::DecodeError::Core(DecodeError::Read(e)) => {
+                io::Error::new(io::ErrorKind::Other, e)
+            }
+            cbor4ii::serde::DecodeError::Core(e @ DecodeError::Unsupported { .. }) => {
+                io::Error::new(io::ErrorKind::Unsupported, e)
+            }
+            cbor4ii::serde::DecodeError::Core(e @ DecodeError::Eof { .. }) => {
+                io::Error::new(io::ErrorKind::UnexpectedEof, e)
+            }
+            cbor4ii::serde::DecodeError::Core(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            cbor4ii::serde::DecodeError::Custom(e) => {
+                io::Error::new(io::ErrorKind::Other, e.to_string())
+            }
+        }
+    }
+
+    fn encode_into_io_error(err: cbor4ii::serde::EncodeError<TryReserveError>) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, err)
+    }
 }

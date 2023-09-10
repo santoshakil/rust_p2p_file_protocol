@@ -32,3 +32,5 @@ ipfs-embed = { version = "0.26", features = [
 rand = "0.8"
 anyhow = "1"
 cid = "0"
+cbor4ii = { version = "0.3.1", features = ["serde1", "use_std"] }
+libp2p-swarm = "0.43.3"
