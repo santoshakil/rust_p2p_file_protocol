@@ -1,139 +1,65 @@
-use std::io::Read;
-
-use futures::StreamExt;
+use futures::prelude::*;
+use libp2p::core::upgrade::Version;
 use libp2p::{
-    core::upgrade,
-    identity::Keypair,
-    mdns, noise,
-    swarm::NetworkBehaviour,
-    swarm::{SwarmBuilder, SwarmEvent},
-    tcp, yamux, PeerId, Swarm, Transport,
+    identity, mdns, noise,
+    swarm::{keep_alive, NetworkBehaviour, SwarmBuilder, SwarmEvent},
+    tcp, yamux, PeerId, Transport,
 };
-
-use libp2p_stream_protocol::ResponseChannel;
-use mdns::Event::Discovered;
-use tokio::{sync::mpsc::UnboundedSender, task};
-
-type ReqResEvent = libp2p_stream_protocol::Event<ReqRes, ReqRes>;
-type ReqResChannel = UnboundedSender<(ReqRes, ResponseChannel<ReqRes>)>;
-
-#[derive(NetworkBehaviour)]
-struct MyBehaviour {
-    reqres: libp2p_stream_protocol::cbor::Behaviour<ReqRes, ReqRes>,
-    mdns: mdns::async_io::Behaviour,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-struct ReqRes {
-    data: Vec<u8>,
-}
+use libp2p_stream_protocol as libp2p_stream;
+use std::error::Error;
 
 #[tokio::main]
-async fn main() {
-    let (mut swarm, _key_pair, _my_peer) = build_swarp();
-    let (s, mut r) = tokio::sync::mpsc::unbounded_channel::<(ReqRes, ResponseChannel<ReqRes>)>();
+async fn main() -> Result<(), Box<dyn Error>> {
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+    println!("Local peer id: {local_peer_id:?}");
+
+    let transport = tcp::async_io::Transport::default()
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(&local_key)?)
+        .multiplex(yamux::Config::default())
+        .boxed();
+
+    let mut mdns_config = mdns::Config::default();
+    mdns_config.query_interval = std::time::Duration::from_secs(5);
+
+    let behaviour = Behaviour {
+        mdns: mdns::tokio::Behaviour::new(mdns_config, local_peer_id).unwrap(),
+        keep_alive: keep_alive::Behaviour::default(),
+        stream: libp2p_stream::Behaviour::default(),
+    };
+
+    let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id).build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
     loop {
-        tokio::select! {
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on {:?}", address);
-                }
-                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(Discovered(peers_datum))) => {
-                    for peer_data in peers_datum {
-                        let peer = peer_data.0.clone();
-                        let _addr = peer_data.1.clone();
-                        println!("Found peer {:?}", peer);
-                        if !swarm.is_connected(&peer) {
-                            swarm.dial(peer).unwrap();
-                            _ = swarm.behaviour_mut().reqres.send_request(
-                                &peer,
-                                ReqRes {
-                                    data: "hello".as_bytes().to_vec(),
-                                },
-                            );
-                        }
+        let event = swarm.select_next_some().await;
+        match event {
+            SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(data))) => {
+                for (peer, ..) in data {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if !swarm.is_connected(&peer) {
+                        println!("Connecting {peer:?}");
+                        _ = swarm.dial(peer);
                     }
                 }
-                SwarmEvent::Behaviour(MyBehaviourEvent::Reqres(reqres)) => {
-                    task::spawn(handle_reqres(reqres, s.clone()));
-                }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!("Connection established with {}", peer_id);
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    let is_closed = !swarm.is_connected(&peer_id);
-                    println!("Connection with {} closed: {}", peer_id, is_closed);
-                }
-                SwarmEvent::IncomingConnection { .. } => {}
-                _ => {
-                    println!("Got an event: {:?}", event);
-                },
-            },
-            r = r.recv() => {
-                if let Some((res, chanel)) = r {
-                    _ = swarm.behaviour_mut().reqres.send_response(chanel, res.clone());
-                }
             }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                println!("Connection established: {peer_id:?}");
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                println!("Connection closed: {peer_id:?}");
+            }
+            _ => println!("{event:?}"),
         }
     }
 }
 
-async fn handle_reqres(reqres: ReqResEvent, s: ReqResChannel) {
-    match reqres {
-        libp2p_stream_protocol::Event::Message { peer: _, message } => match message {
-            libp2p_stream_protocol::Message::Request {
-                request, channel, ..
-            } => {
-                println!(
-                    "\nReqRes(Message::Request): request: {:?},\nchannel: {:?}\n",
-                    request, channel
-                );
-                let mut file_buf = Vec::new();
-                let mut file = std::fs::File::open("demo/22mb.jpg").unwrap();
-                let _ = file.read_to_end(&mut file_buf).unwrap();
-                let res = ReqRes { data: file_buf };
-                _ = s.send((res, channel));
-            }
-            libp2p_stream_protocol::Message::Response { response, .. } => {
-                println!("\nReqRes(Message::Response): response: {:?}\n", response);
-            }
-        },
-        _ => {
-            println!("\nReqRes event: {:?}\n", reqres);
-        }
-    }
-}
-
-fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
-    let id_keys = Keypair::generate_ed25519();
-    let peer = PeerId::from(id_keys.public());
-    println!("Local peer id: {peer}");
-    let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), peer).unwrap();
-    let tcp_config = tcp::Config::default().nodelay(true);
-    let yc = yamux::Config::default();
-    // yc.set_max_buffer_size(10 * 1024 * 1024);
-    // yc.set_receive_window_size(1024 * 1024);
-    // yc.set_window_update_mode(yamux::WindowUpdateMode::on_receive());
-    let transport = tcp::tokio::Transport::new(tcp_config)
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&id_keys).expect("signing libp2p-noise static keypair"))
-        .multiplex(yc);
-    let mut reqres_config = libp2p_stream_protocol::Config::default();
-    reqres_config.set_request_timeout(std::time::Duration::from_secs(60));
-    reqres_config.set_connection_keep_alive(std::time::Duration::from_secs(60));
-    let behaviour = MyBehaviour {
-        mdns,
-        reqres: libp2p_stream_protocol::Behaviour::new(
-            [(
-                libp2p::StreamProtocol::new("/my-cbor-protocol"),
-                libp2p_stream_protocol::ProtocolSupport::Full,
-            )],
-            reqres_config,
-        ),
-    };
-    let mut swarm = SwarmBuilder::with_tokio_executor(transport.boxed(), behaviour, peer).build();
-    swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-        .unwrap();
-    (swarm, id_keys, peer)
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    keep_alive: keep_alive::Behaviour,
+    stream: libp2p_stream::Behaviour,
+    mdns: mdns::tokio::Behaviour,
 }

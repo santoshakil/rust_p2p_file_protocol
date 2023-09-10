@@ -5,31 +5,7 @@ edition = "2021"
 
 
 [dependencies]
-libp2p-swarm = "0.43.3"
-libp2p-mplex = "0.40"
-libp2p-yamux = "0.44"
-libp2p-tcp = "0.40"
-libp2p-core = "0.40"
-libp2p-quic = { version = "0.9.0-alpha", features = ["tokio", "async-std"] }
-libp2p = { version = "0.52", features = ["full"] }
-async-std = { version = "1.12", features = ["attributes"] }
-async-trait = "0.1"
-env_logger = "0.10"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.20"
-serde = { version = "1.0", features = ["derive"] }
-crossbeam-channel = "0.5"
-libp2p-bitswap = { version = "0.25", features = ["compat"] }
-libipld = "0.16"
-ipfs-embed = { version = "0.26", features = [
-    "async_global",
-    "rsa",
-    "ecdsa",
-    "secp256k1",
-] }
-rand = "0.8"
-anyhow = "1"
-cid = "0"
-cbor4ii = { version = "0.3.1", features = ["serde1", "use_std"] }
+libp2p = { version = "0.52", features = ["full"] }
 libp2p_stream_protocol = { version = "0.1.0", path = "../libp2p_stream_protocol" }
