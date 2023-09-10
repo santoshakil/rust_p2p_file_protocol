@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .boxed();
 
     let mut mdns_config = mdns::Config::default();
-    mdns_config.query_interval = std::time::Duration::from_secs(5);
+    mdns_config.query_interval = std::time::Duration::from_secs(10);
 
     let behaviour = Behaviour {
         mdns: mdns::tokio::Behaviour::new(mdns_config, local_peer_id).unwrap(),
