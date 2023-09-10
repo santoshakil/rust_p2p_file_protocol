@@ -1,5 +1,5 @@
 [package]
-name = "rust_libp2p_bitswap_playground"
+name = "rust_p2p_file_protocol"
 version = "0.1.0"
 edition = "2021"
 
