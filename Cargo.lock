@@ -3263,6 +3263,18 @@ dependencies = [
 [[package]]
 name = "libp2p_stream_protocol"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "instant",
+ "libp2p-core 0.40.0",
+ "libp2p-identity 0.2.3",
+ "libp2p-swarm 0.43.3",
+ "log",
+ "rand 0.8.5",
+ "smallvec",
+ "void",
+]
 
 [[package]]
 name = "libsecp256k1"
