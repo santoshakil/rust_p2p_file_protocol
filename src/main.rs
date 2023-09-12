@@ -1,7 +1,7 @@
 use futures::prelude::*;
 use libp2p::core::upgrade::Version;
 use libp2p::{
-    identity, mdns, noise,
+    identity, mdns, noise, request_response,
     swarm::{keep_alive, NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp, yamux, PeerId, Transport,
 };
@@ -19,14 +19,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .authenticate(noise::Config::new(&local_key)?)
         .multiplex(yamux::Config::default())
         .boxed();
-
     let mut mdns_config = mdns::Config::default();
     mdns_config.query_interval = std::time::Duration::from_secs(10);
 
     let behaviour = Behaviour {
         mdns: mdns::tokio::Behaviour::new(mdns_config, local_peer_id).unwrap(),
         keep_alive: keep_alive::Behaviour::default(),
-        stream: libp2p_stream::Behaviour::default(),
+        stream: libp2p_stream::Behaviour::new(),
+        req_res: libp2p::request_response::cbor::Behaviour::<String, String>::new(
+            [(
+                libp2p::StreamProtocol::new("/my-cbor-protocol"),
+                request_response::ProtocolSupport::Full,
+            )],
+            libp2p::request_response::Config::default(),
+        ),
     };
 
     let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id).build();
@@ -36,10 +42,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         let event = swarm.select_next_some().await;
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("Listening on {address:?}");
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(data))) => {
-                for (peer, ..) in data {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                for (peer, _addr) in data {
                     if !swarm.is_connected(&peer) {
                         println!("Connecting {peer:?}");
                         _ = swarm.dial(peer);
@@ -59,6 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    req_res: request_response::cbor::Behaviour<String, String>,
     keep_alive: keep_alive::Behaviour,
     stream: libp2p_stream::Behaviour,
     mdns: mdns::tokio::Behaviour,

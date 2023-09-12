@@ -3009,6 +3009,7 @@ dependencies = [
  "futures",
  "libp2p",
  "libp2p_stream_protocol",
+ "rand 0.8.5",
  "tokio",
 ]
 
