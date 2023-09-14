@@ -42,7 +42,7 @@ async fn main() {
                     let peer = PeerId::from_str(&line).unwrap();
                     let req_s = s.clone();
                     task::spawn(async move {
-                        _ = send_file(id, peer, "demo/22mb.jpg".to_string(), res_r, req_s).await;
+                        _ = send_file(id, peer, "demo/meilisearch".to_string(), res_r, req_s).await;
                     });
                 }
             },
@@ -135,7 +135,7 @@ async fn handle_req(
     success_s.send((success, c)).unwrap();
 }
 
-const BUF: usize = 100 * 1024 * 1024;
+const BUF: usize = 10 * 1024 * 1024;
 async fn send_file(
     id: String,
     peer: PeerId,
@@ -143,6 +143,7 @@ async fn send_file(
     mut res_r: UnboundedReceiver<ReqRes>,
     req_s: UnboundedSender<(ReqRes, PeerId)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
     let mut file = std::fs::File::open(&file_name)?;
     let file_len = file.metadata()?.len() as usize;
     println!(
@@ -175,7 +176,6 @@ async fn send_file(
                     let mut tried: i8 = 1;
                     if res.success.unwrap_or(false) {
                         if last {
-                            println!("File {} sent to peer: {}", &file_name, &peer);
                             break 'outer;
                         }
                         break;
@@ -192,6 +192,12 @@ async fn send_file(
             }
         }
     }
+    println!(
+        "File {} sent to peer: {} in {:?}",
+        &file_name,
+        &peer,
+        start.elapsed()
+    );
     Ok(())
 }
 
