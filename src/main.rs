@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, io::Read, path::PathBuf, str::FromStr};
 
 use futures::StreamExt;
 use libp2p::{
@@ -13,7 +13,7 @@ use libp2p::{
 
 use mdns::Event::Discovered;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     task,
 };
@@ -135,8 +135,7 @@ async fn handle_req(
     success_s.send((success, c)).unwrap();
 }
 
-const BUF: usize = 1 * 1024 * 1024;
-
+const BUF: usize = 100 * 1024 * 1024;
 async fn send_file(
     id: String,
     peer: PeerId,
@@ -144,33 +143,36 @@ async fn send_file(
     mut res_r: UnboundedReceiver<ReqRes>,
     req_s: UnboundedSender<(ReqRes, PeerId)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(&file_name)
-        .await?;
-    let file_len = file.metadata().await?.len();
+    let mut file = std::fs::File::open(&file_name)?;
+    let file_len = file.metadata()?.len() as usize;
     println!(
         "Sending file: {} with len {} to peer {}",
         &file_name, file_len, &peer
     );
     let mut buf = vec![0; BUF];
-    let mut sent = 0;
+    let mut sent: usize = 0;
     'outer: loop {
-        let n = file.read(&mut buf).await?;
-        sent += n;
-        let last = n < BUF;
+        let read = file.read(&mut buf)?;
+        println!("Read {} bytes", read);
+        sent += read;
+        if sent > file_len {
+            eprintln!("Sent more than file len. Something went wrong!");
+            break 'outer;
+        }
+        let last = sent == file_len;
         let req = ReqRes::file_block(
             id.clone(),
-            buf[..n].to_vec(),
+            buf[..read].to_vec(),
             sent,
             last,
             Some(file_name.clone()),
         );
         req_s.send((req.clone(), peer.clone()))?;
-        println!("Sent: {} bytes", sent);
+        println!("Total sent {} blocks", sent);
         loop {
             if let Some(res) = res_r.recv().await {
                 if res.id == id {
+                    let mut tried: i8 = 1;
                     if res.success.unwrap_or(false) {
                         if last {
                             println!("File {} sent to peer: {}", &file_name, &peer);
@@ -178,8 +180,13 @@ async fn send_file(
                         }
                         break;
                     } else {
+                        if tried == 3 {
+                            println!("Failed to send file: {}", &file_name);
+                            break 'outer;
+                        }
+                        tried += 1;
                         req_s.send((req.clone(), peer.clone()))?;
-                        println!("Resending block from: {}", res.sent.unwrap());
+                        println!("Resending({}) block from: {}", tried, &file_name);
                     }
                 }
             }
