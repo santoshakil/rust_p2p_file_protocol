@@ -10,3 +10,9 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 libp2p = { version = "0.52", features = ["full"] }
 libp2p_stream_protocol = { version = "0.1.0", path = "../libp2p_stream_protocol" }
+
+cbor4ii = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+uuid = { version = "1.4", features = ["v4"] }
