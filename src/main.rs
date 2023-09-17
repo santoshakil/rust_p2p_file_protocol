@@ -19,7 +19,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-type StreamsMap = HashMap<String, UnboundedSender<ReqRes>>;
+type StreamsMap = HashMap<(String, String), UnboundedSender<ReqRes>>;
 
 #[tokio::main]
 async fn main() {
@@ -35,11 +35,11 @@ async fn main() {
     loop {
         tokio::select! {
             line = line.next_line() => {
-                if let Ok(Some(line)) = line {
+                if let Ok(Some(peer)) = line {
                     let id = Uuid::new_v4().to_string();
                     let (res_s, res_r) = unbounded_channel::<ReqRes>();
-                    streams.insert(id.clone(), res_s);
-                    let peer = PeerId::from_str(&line).unwrap();
+                    streams.insert((peer.clone(), id.clone()), res_s);
+                    let peer = PeerId::from_str(&peer).unwrap();
                     let req_s = s.clone();
                     task::spawn(async move {
                         _ = send_file(id, peer, "demo/meilisearch".to_string(), res_r, req_s).await;
@@ -49,19 +49,20 @@ async fn main() {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(MyBehaviourEvent::Reqres(reqres)) => {
                     match reqres {
-                        ReqResEvent::Message { peer: _, message } => match message {
+                        ReqResEvent::Message { peer, message } => match message {
                             request_response::Message::Request {
                                 request: req, channel: c, ..
                             } => {
+                                let len = req.clone().data.unwrap_or([].to_vec()).len();
                                 println!(
-                                    "Got request with len: {:?}",
-                                    req.clone().data.unwrap_or([].to_vec()).len()
+                                    "Got request with len: {:?} message: {:?}",
+                                    len, req.message
                                 );
                                 task::spawn(handle_req(req, c, success_s.clone()));
                             }
                             request_response::Message::Response { response, .. } => {
                                 println!("Got response: {:?}", response);
-                                if let Some(res_s) = streams.get(&response.id) {
+                                if let Some(res_s) = streams.get(&(peer.to_string(), response.clone().id)) {
                                     _ = res_s.send(response);
                                 }
                             }
@@ -85,7 +86,17 @@ async fn main() {
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     let is_closed = !swarm.is_connected(&peer_id);
-                    println!("Connection with {} closed: {}", peer_id, is_closed);
+                    if is_closed {
+                        println!("Connection with {} closed", peer_id);
+                        streams.retain(|(peer, _), c| {
+                            if peer == &peer_id.to_string() {
+                                c.send(ReqRes::exit_data(peer.to_string())).unwrap();
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
                 }
                 SwarmEvent::IncomingConnection { .. } => {}
                 _ => {
@@ -176,6 +187,12 @@ async fn send_file(
                     let mut tried: i8 = 1;
                     if res.success.unwrap_or(false) {
                         if last {
+                            println!(
+                                "File {} sent to peer: {} in {:?}",
+                                &file_name,
+                                &peer,
+                                start.elapsed()
+                            );
                             break 'outer;
                         }
                         break;
@@ -188,16 +205,13 @@ async fn send_file(
                         req_s.send((req.clone(), peer.clone()))?;
                         println!("Resending({}) block from: {}", tried, &file_name);
                     }
+                } else if res.id == peer.to_string() {
+                    println!("Peer {} exited", &peer);
+                    break 'outer;
                 }
             }
         }
     }
-    println!(
-        "File {} sent to peer: {} in {:?}",
-        &file_name,
-        &peer,
-        start.elapsed()
-    );
     Ok(())
 }
 
@@ -318,6 +332,19 @@ impl ReqRes {
         Self {
             id,
             success: Some(true),
+            message: None,
+            file_name: None,
+            path: None,
+            data: None,
+            sent: None,
+            last: None,
+        }
+    }
+
+    pub fn exit_data(id: String) -> Self {
+        Self {
+            id,
+            success: Some(false),
             message: None,
             file_name: None,
             path: None,
