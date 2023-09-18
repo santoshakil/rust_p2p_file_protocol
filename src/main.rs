@@ -219,7 +219,9 @@ fn build_swarp() -> (Swarm<MyBehaviour>, Keypair, PeerId) {
     let id_keys = Keypair::generate_ed25519();
     let peer = PeerId::from(id_keys.public());
     println!("Local peer id: {peer}");
-    let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), peer).unwrap();
+    let mut mdns_config = mdns::Config::default();
+    mdns_config.query_interval = std::time::Duration::from_secs(10);
+    let mdns = mdns::async_io::Behaviour::new(mdns_config, peer).unwrap();
     let tcp_config = tcp::Config::default().nodelay(true);
     let mut yc = yamux::Config::default();
     yc.set_max_buffer_size(100 * 1024 * 1024);
